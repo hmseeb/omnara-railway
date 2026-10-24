@@ -79,11 +79,31 @@ COMMIT;
 SQL
 }
 
+mint_reset_link() {
+  local norm hash
+  norm=$(printf %s "$OMNARA_ADMIN_EMAIL" | tr -d '[:space:]'); norm=${norm,,}
+  hash=$(printf %s "$OMNARA_RESET_TOKEN" | sha256sum | cut -c1-64)
+  sql -v norm="$norm" -v hash="$hash" <<'SQL' >/dev/null
+INSERT INTO user_auth_tokens(user_id, purpose, token_hash, created_at, expires_at)
+SELECT user_id, 'password_reset', :'hash', statement_timestamp(), statement_timestamp() + interval '1 day'
+FROM user_emails WHERE normalized_email = :'norm' AND verified_at IS NOT NULL
+ON CONFLICT (token_hash) DO NOTHING;
+SQL
+}
+
 configure_auth() {
   export OMNARA_AUTH_SIGNUP_ENABLED OMNARA_AUTH_PASSWORD_RESET_ENABLED OMNARA_EMAIL_DRIVER \
          OMNARA_EMAIL_FROM OMNARA_SMTP_ADDR
-  if claimed; then
-    # no mail provider: signup, password reset and their mail stay off for good
+  if claimed && [ -n "${OMNARA_RESET_TOKEN:-}" ]; then
+    # Lost password: a deployer-set OMNARA_RESET_TOKEN becomes a reset link for the admin,
+    # the same way the setup link works. Reset mail still goes to the dead port.
+    mint_reset_link
+    OMNARA_AUTH_SIGNUP_ENABLED=0 OMNARA_AUTH_PASSWORD_RESET_ENABLED=1
+    OMNARA_EMAIL_DRIVER=smtp OMNARA_SMTP_ADDR=127.0.0.1:1 OMNARA_EMAIL_FROM=noreply@localhost.invalid
+    echo "==> password reset link for $OMNARA_ADMIN_EMAIL (delete OMNARA_RESET_TOKEN once used):"
+    echo "    $OMNARA_PUBLIC_URL/reset-password?token=$OMNARA_RESET_TOKEN"
+  elif claimed; then
+    # no mail provider: signup, password reset and their mail stay off
     OMNARA_AUTH_SIGNUP_ENABLED=0 OMNARA_AUTH_PASSWORD_RESET_ENABLED=0
     OMNARA_EMAIL_DRIVER=none OMNARA_SMTP_ADDR= OMNARA_EMAIL_FROM=
     echo "==> claimed: signup is off"

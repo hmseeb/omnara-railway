@@ -30,7 +30,7 @@ app() {
     -e OMNARA_BLOB_S3_ACCESS_KEY_ID=omnara -e OMNARA_BLOB_S3_SECRET_ACCESS_KEY=omnara-blobs -e OMNARA_BLOB_S3_USE_PATH_STYLE=1 \
     -e OMNARA_ADMIN_EMAIL="${1:-$ADMIN}" -e OMNARA_SETUP_TOKEN=$TOKEN \
     -e OMNARA_ENCRYPTION_KEY_HEX=$(printf 'ab%.0s' $(seq 32)) -e OMNARA_SKILL_SIGNING_KEY_HEX=$(printf 'cd%.0s' $(seq 32)) \
-    "$IMG" >/dev/null
+    ${RESET:+-e OMNARA_RESET_TOKEN=$RESET} "$IMG" >/dev/null
   up
 }
 up() { for _ in $(seq 1 90); do curl -fs -o /dev/null -H "Host: localhost:$PORT" "http://127.0.0.1:$PORT/healthz" && return; sleep 1; done; }
@@ -52,7 +52,7 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: evil.example.com" "http://1
 p=$(curl -s -H "Host: localhost:$PORT" "http://127.0.0.1:$PORT/agents")
 [[ $p == *'<div id="root"'* || $p == *'<script'* ]] && ok "web app served (SPA fallback)" || no "web app: ${p:0:200}"
 
-docker logs $N-app 2>&1 | grep -q "/verify-email?token=$TOKEN" && ok "logs print the setup link" || no "no setup link in logs"
+grep -q "/verify-email?token=$TOKEN" <<<"$(docker logs $N-app 2>&1)" && ok "logs print the setup link" || no "no setup link in logs"
 
 # a stranger can start a signup, but its mail goes nowhere: no token, no account
 c=$(code /api/auth/signup --data '{"email":"stranger@example.com"}')
@@ -83,5 +83,23 @@ c=$(code /api/auth/signup --data '{"email":"late@example.com"}')
 [ "$c" = 404 ] && ok "signup stays off after a redeploy" || no "signup after redeploy got $c"
 c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"$PW\"}")
 [ "$c" = 200 ] && ok "admin survives a redeploy" || no "login after redeploy got $c"
+
+# lost password: a deployer-set OMNARA_RESET_TOKEN is a one-time reset link for the admin
+RESET=resettoken0123456789abcdefghijklmnopqrstuvwxyz; NEWPW='Changed-Passphrase-77!'
+docker rm -f $N-app >/dev/null; app
+grep -q "/reset-password?token=$RESET" <<<"$(docker logs $N-app 2>&1)" && ok "logs print the reset link" || no "no reset link in logs"
+c=$(code /api/auth/password/reset --data "{\"token\":\"guess\",\"password\":\"$NEWPW\"}")
+[ "$c" != 200 ] && ok "a guessed reset token is refused ($c)" || no "guessed reset token accepted"
+c=$(code /api/auth/password/reset --data "{\"token\":\"$RESET\",\"password\":\"$NEWPW\"}")
+[ "$c" = 200 ] && ok "reset link sets a new password" || no "reset got $c"
+c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"$NEWPW\"}")
+[ "$c" = 200 ] && ok "admin logs in with the new password" || no "login after reset got $c"
+c=$(code /api/auth/password/reset --data "{\"token\":\"$RESET\",\"password\":\"$PW\"}")
+[ "$c" != 200 ] && ok "reset link works once" || no "reset link reused"
+c=$(code /api/auth/signup --data '{"email":"late@example.com"}')
+[ "$c" = 404 ] && ok "signup stays off during a reset" || no "signup during reset got $c"
+docker rm -f $N-app >/dev/null; RESET=; app
+c=$(code /api/auth/password/reset --data "{\"token\":\"x\",\"password\":\"$NEWPW\"}")
+[ "$c" = 404 ] && ok "reset route off again once the variable is removed" || no "reset route after removal got $c"
 
 [ $fail = 0 ] && echo "all green" || { docker logs $N-app 2>&1 | tail -40; exit 1; }

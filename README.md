@@ -7,7 +7,8 @@ Railway cannot share a volume between services, and Omnara's api, worker and mai
 mount the same memory directory, so they run together here.
 
 The instance is locked to the deployer. A setup link for `OMNARA_ADMIN_EMAIL` (token in
-`OMNARA_SETUP_TOKEN`) is the only way to create an account. Signup turns off once that account exists.
+`OMNARA_SETUP_TOKEN`) is the only way to create an account. Signup turns off once that account exists. A lost password is recovered the same way, with
+`OMNARA_RESET_TOKEN`.
 
 - `image/` - Dockerfile, `boot.sh`, nginx config
 - `test/contract.sh` - contract test, run in CI before every push to `ghcr.io/hmseeb/omnara-railway`
