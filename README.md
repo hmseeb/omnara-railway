@@ -8,9 +8,10 @@ upstream's unmodified v0.2.10 api, worker, maintenance and web, in one container
 Railway cannot share a volume between services, and Omnara's api, worker and maintenance all
 mount the same memory directory, so they run together here.
 
-The instance is locked to the deployer. A setup link for `OMNARA_ADMIN_EMAIL` (token in
-`OMNARA_SETUP_TOKEN`) is the only way to create an account. Signup turns off once that account exists. A lost password is recovered the same way, with
-`OMNARA_RESET_TOKEN`.
+The instance is locked to the deployer. Signup and password reset are always off. On boot,
+before nginx opens, the container creates the one admin account from `OMNARA_ADMIN_EMAIL` and the
+generated `OMNARA_ADMIN_PASSWORD` through Omnara's own endpoints on loopback. Editing the password
+variable and redeploying changes the password.
 
 - `image/` - Dockerfile, `boot.sh`, nginx config
 - `test/contract.sh` - contract test, run in CI before every push to `ghcr.io/hmseeb/omnara-railway`

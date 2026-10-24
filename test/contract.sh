@@ -1,7 +1,7 @@
 #!/bin/bash
 # Contract for the image: what Railway and a deployer rely on. Runs postgres, redis and an
 # S3 server in one network namespace with the image (upstream refuses a non-HTTPS S3
-# endpoint unless it is localhost), then drives the claim and the signup lock.
+# endpoint unless it is localhost), then drives the admin account and the signup lock.
 #   test/contract.sh [image]   (default: builds image/ as omnara-railway:test)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -9,11 +9,11 @@ IMG=${1:-omnara-railway:test}
 [ -n "${1:-}" ] || docker build -q -t "$IMG" image >/dev/null || { echo "build failed"; exit 1; }
 
 N=omnara-contract-$$; PORT=18080; ORIGIN=http://localhost:$PORT
-ADMIN=Admin@Example.com; TOKEN=setuptoken0123456789abcdefghijklmnopqrstuvwxyzAB; PW='Long-Test-Passphrase-42!'
+ADMIN=Admin@Example.com; PW='Omnara-Gen3rated"Pass\word-9!'
 fail=0
 ok() { echo "ok   $1"; }
 no() { echo "FAIL $1"; fail=1; }
-cleanup() { docker rm -f $N-app $N-pg $N-redis $N-s3 >/dev/null 2>&1; docker volume rm $N-data >/dev/null 2>&1; }
+cleanup() { docker rm -f $N-app $N-pg $N-redis $N-s3 >/dev/null 2>&1; docker volume rm $N-data >/dev/null 2>&1; rm -f /tmp/$N.jar; }
 trap cleanup EXIT
 
 docker run -d --name $N-s3 -p 127.0.0.1:$PORT:8080 -e RUSTFS_ACCESS_KEY=omnara -e RUSTFS_SECRET_KEY=omnara-blobs \
@@ -22,29 +22,31 @@ docker run -d --name $N-pg --network container:$N-s3 -e POSTGRES_USER=omnara -e 
   -e POSTGRES_DB=omnara postgres:18-alpine >/dev/null
 docker run -d --name $N-redis --network container:$N-s3 valkey/valkey:9-alpine >/dev/null
 
-app() {
+app() {  # $1 = OMNARA_ADMIN_PASSWORD
+  docker rm -f $N-app >/dev/null 2>&1
   docker run -d --name $N-app --network container:$N-s3 -v $N-data:/data \
     -e OMNARA_DATABASE_URL=postgres://omnara:omnara@127.0.0.1:5432/omnara?sslmode=disable \
     -e OMNARA_REDIS_URL=redis://127.0.0.1:6379/0 -e OMNARA_PUBLIC_URL=$ORIGIN \
     -e OMNARA_BLOB_S3_BUCKET=omnara -e OMNARA_BLOB_S3_REGION=us-east-1 -e OMNARA_BLOB_S3_ENDPOINT=http://localhost:9000 \
     -e OMNARA_BLOB_S3_ACCESS_KEY_ID=omnara -e OMNARA_BLOB_S3_SECRET_ACCESS_KEY=omnara-blobs -e OMNARA_BLOB_S3_USE_PATH_STYLE=1 \
-    -e OMNARA_ADMIN_EMAIL="${1:-$ADMIN}" -e OMNARA_SETUP_TOKEN=$TOKEN \
+    -e OMNARA_ADMIN_EMAIL="$ADMIN" -e OMNARA_ADMIN_PASSWORD="$1" \
     -e OMNARA_ENCRYPTION_KEY_HEX=$(printf 'ab%.0s' $(seq 32)) -e OMNARA_SKILL_SIGNING_KEY_HEX=$(printf 'cd%.0s' $(seq 32)) \
-    ${RESET:+-e OMNARA_RESET_TOKEN=$RESET} "$IMG" >/dev/null
-  up
+    "$IMG" >/dev/null
+  for _ in $(seq 1 90); do curl -fs -o /dev/null -H "Host: localhost:$PORT" "http://127.0.0.1:$PORT/healthz" && return; sleep 1; done
 }
-up() { for _ in $(seq 1 90); do curl -fs -o /dev/null -H "Host: localhost:$PORT" "http://127.0.0.1:$PORT/healthz" && return; sleep 1; done; }
+logs() { docker logs $N-app 2>&1; }
 post() { local path=$1; shift; curl -s -H "Host: localhost:$PORT" -H "Origin: $ORIGIN" -H 'Content-Type: application/json' "$@" "http://127.0.0.1:$PORT$path"; }
 code() { post "$@" -o /dev/null -w '%{http_code}'; }
+json() { local s=${1//\\/\\\\}; printf '"%s"' "${s//\"/\\\"}"; }
+login() { code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":$(json "$1")}"; }
 
-for _ in $(seq 1 30); do docker exec $N-s3 sh -c 'exit 0' 2>/dev/null && break; sleep 1; done
 sleep 3
 docker run --rm --network container:$N-s3 curlimages/curl -fsS -o /dev/null -X PUT --aws-sigv4 'aws:amz:us-east-1:s3' \
   --user omnara:omnara-blobs http://localhost:9000/omnara || no "bucket create"
 
-app
+app "$PW"
 c=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: healthcheck.railway.app" "http://127.0.0.1:$PORT/healthz")
-[ "$c" = 200 ] && ok "Railway healthcheck host gets 200 on /healthz" || { no "healthcheck host got $c"; docker logs $N-app 2>&1 | tail -30; exit 1; }
+[ "$c" = 200 ] && ok "Railway healthcheck host gets 200 on /healthz" || { no "healthcheck host got $c"; logs | tail -30; exit 1; }
 
 c=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: evil.example.com" "http://127.0.0.1:$PORT/api/auth/login")
 [ "$c" = 404 ] && ok "unknown Host refused on the api" || no "unknown Host got $c"
@@ -52,54 +54,39 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: evil.example.com" "http://1
 p=$(curl -s -H "Host: localhost:$PORT" "http://127.0.0.1:$PORT/agents")
 [[ $p == *'<div id="root"'* || $p == *'<script'* ]] && ok "web app served (SPA fallback)" || no "web app: ${p:0:200}"
 
-grep -q "/verify-email?token=$TOKEN" <<<"$(docker logs $N-app 2>&1)" && ok "logs print the setup link" || no "no setup link in logs"
+grep -q "admin account created: $ADMIN" <<<"$(logs)" && ok "first boot creates the admin account" || no "no account created: $(logs | grep -i warn | tail -3)"
+[ "$(login "$PW")" = 200 ] && ok "admin logs in with OMNARA_ADMIN_PASSWORD (quotes and backslash survive)" || no "login failed"
+[ "$(login 'Wrong-Password-1!')" = 401 ] && ok "wrong password refused" || no "wrong password not refused"
+grep -qF "$PW" <<<"$(logs)" && no "password printed in logs" || ok "password never printed in logs"
 
-# a stranger can start a signup, but its mail goes nowhere: no token, no account
 c=$(code /api/auth/signup --data '{"email":"stranger@example.com"}')
-[ "$c" = 202 ] && ok "stranger signup accepted without a reachable mailer" || no "stranger signup got $c"
-c=$(code /api/auth/email/verify --data "{\"token\":\"guess\",\"password\":\"$PW\"}")
-[ "$c" != 200 ] && ok "a guessed token is refused ($c)" || no "guessed token accepted"
-
-# the deployer redeems the setup link
-h=$(post /api/auth/email/verify -D - -o /dev/null --data "{\"token\":\"$TOKEN\",\"password\":\"$PW\"}")
-grep -q '^HTTP/1.1 200' <<<"$h" && grep -qi '^set-cookie:' <<<"$h" && ok "setup link creates the admin and signs in" || no "claim: $h"
-
-# the watcher restarts everything in place with signup off
-for _ in $(seq 1 30); do docker logs $N-app 2>&1 | grep -q 'claimed: signup is off' && break; sleep 1; done
-up
-c=$(code /api/auth/signup --data '{"email":"late@example.com"}')
-[ "$c" = 404 ] && ok "signup is off once claimed" || no "signup after claim got $c"
-c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"$PW\"}")
-[ "$c" = 200 ] && ok "admin logs in (email matched case-insensitively)" || no "login got $c"
-c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"wrong password here\"}")
-[ "$c" = 401 ] && ok "wrong password refused" || no "wrong password got $c"
+[ "$c" = 404 ] && ok "signup is off" || no "signup got $c"
+c=$(code /api/auth/password/reset --data '{"token":"x","password":"Whatever-Pass-1!"}')
+[ "$c" = 404 ] && ok "password reset is off" || no "reset got $c"
 
 u=$(docker exec $N-app sh -c 'for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = omnara-api ] && stat -c %u $p && break; done')
-[[ $u == 65532 || $u == nonroot ]] && ok "api runs as nonroot" || no "api runs as '$u'"
+[ "$u" = 65532 ] && ok "api runs as nonroot" || no "api runs as '$u'"
 
-# same volume and database, new container: what a Railway redeploy does
-docker rm -f $N-app >/dev/null; app
-c=$(code /api/auth/signup --data '{"email":"late@example.com"}')
-[ "$c" = 404 ] && ok "signup stays off after a redeploy" || no "signup after redeploy got $c"
-c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"$PW\"}")
-[ "$c" = 200 ] && ok "admin survives a redeploy" || no "login after redeploy got $c"
+# a password changed in the app survives redeploys while the variable is unchanged
+post /api/auth/login -c /tmp/$N.jar -o /dev/null --data "{\"email\":\"admin@example.com\",\"password\":$(json "$PW")}"
+csrf=$(awk '$6 ~ /omnara_csrf$/ {print $7}' /tmp/$N.jar)
+c=$(code /api/auth/password/change -b /tmp/$N.jar -H "X-Omnara-Csrf: $csrf" \
+      --data "{\"current_password\":$(json "$PW"),\"new_password\":\"Changed-In-App-42!\"}")
+[ "$c" = 200 ] && ok "password changed in the app" || no "in-app change got $c"
+app "$PW"
+[ "$(login 'Changed-In-App-42!')" = 200 ] && ok "in-app password kept while the variable is unchanged" || no "in-app password lost on redeploy"
+grep -q "password updated" <<<"$(logs)" && no "unchanged variable re-applied" || ok "unchanged variable not re-applied"
 
-# lost password: a deployer-set OMNARA_RESET_TOKEN is a one-time reset link for the admin
-RESET=resettoken0123456789abcdefghijklmnopqrstuvwxyz; NEWPW='Changed-Passphrase-77!'
-docker rm -f $N-app >/dev/null; app
-grep -q "/reset-password?token=$RESET" <<<"$(docker logs $N-app 2>&1)" && ok "logs print the reset link" || no "no reset link in logs"
-c=$(code /api/auth/password/reset --data "{\"token\":\"guess\",\"password\":\"$NEWPW\"}")
-[ "$c" != 200 ] && ok "a guessed reset token is refused ($c)" || no "guessed reset token accepted"
-c=$(code /api/auth/password/reset --data "{\"token\":\"$RESET\",\"password\":\"$NEWPW\"}")
-[ "$c" = 200 ] && ok "reset link sets a new password" || no "reset got $c"
-c=$(code /api/auth/login --data "{\"email\":\"admin@example.com\",\"password\":\"$NEWPW\"}")
-[ "$c" = 200 ] && ok "admin logs in with the new password" || no "login after reset got $c"
-c=$(code /api/auth/password/reset --data "{\"token\":\"$RESET\",\"password\":\"$PW\"}")
-[ "$c" != 200 ] && ok "reset link works once" || no "reset link reused"
-c=$(code /api/auth/signup --data '{"email":"late@example.com"}')
-[ "$c" = 404 ] && ok "signup stays off during a reset" || no "signup during reset got $c"
-docker rm -f $N-app >/dev/null; RESET=; app
-c=$(code /api/auth/password/reset --data "{\"token\":\"x\",\"password\":\"$NEWPW\"}")
-[ "$c" = 404 ] && ok "reset route off again once the variable is removed" || no "reset route after removal got $c"
+# editing the variable replaces the password on the next deploy
+app 'Edited-In-Railway-77!'
+[ "$(login 'Edited-In-Railway-77!')" = 200 ] && [ "$(login 'Changed-In-App-42!')" = 401 ] \
+  && ok "an edited OMNARA_ADMIN_PASSWORD replaces the password" || no "variable edit not applied: $(logs | grep -i warn | tail -2)"
+c=$(code /api/auth/password/reset --data '{"token":"x","password":"Whatever-Pass-1!"}')
+[ "$c" = 404 ] && ok "reset route off again after applying" || no "reset after apply got $c"
 
-[ $fail = 0 ] && echo "all green" || { docker logs $N-app 2>&1 | tail -40; exit 1; }
+# a value upstream refuses keeps the deploy healthy and the old password working
+app short
+[ "$(login 'Edited-In-Railway-77!')" = 200 ] && grep -q 'WARNING: OMNARA_ADMIN_PASSWORD was not applied' <<<"$(logs)" \
+  && ok "a refused OMNARA_ADMIN_PASSWORD is skipped with a warning" || no "refused password: $(logs | tail -3)"
+
+[ $fail = 0 ] && echo "all green" || { logs | tail -40; exit 1; }

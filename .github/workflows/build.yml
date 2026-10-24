@@ -33,7 +33,7 @@ jobs:
           # Railway runs amd64.
           platforms: linux/amd64
           tags: |
-            ghcr.io/${{ github.repository_owner }}/omnara-railway:0.2.10-r2
+            ghcr.io/${{ github.repository_owner }}/omnara-railway:0.2.10-r3
             ghcr.io/${{ github.repository_owner }}/omnara-railway:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
