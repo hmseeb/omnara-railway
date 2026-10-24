@@ -1,5 +1,7 @@
 # omnara-railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/omnara)
+
 Container image for the [Omnara](https://github.com/omnara-ai/omnara) control plane on Railway:
 upstream's unmodified v0.2.10 api, worker, maintenance and web, in one container behind one nginx.
 
